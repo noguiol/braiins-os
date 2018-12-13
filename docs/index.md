@@ -21,6 +21,7 @@ layout: page
       * [Firmware upgrade](#firmware-upgrade)
          * [Upgrade via web interface](#upgrade-via-web-interface)
          * [Upgrade via SSH](#upgrade-via-ssh)
+         * [ Upgrade from Braiins OS preview version](#upgrade-from-braiins-os-preview-version)
       * [Reset to initial Braiins OS version](#reset-to-initial-braiins-os-version)
       * [Recovery Mode](#recovery-mode-1)
 
