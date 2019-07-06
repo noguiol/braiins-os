@@ -29,7 +29,7 @@ import glob
 import filecmp
 import tempfile
 
-import miner.hwid as hwid
+import miner.nand as nand
 
 from itertools import chain
 from collections import OrderedDict, namedtuple
@@ -96,27 +96,6 @@ class Builder:
     BUILD_KEY_NAME = 'key-build'
     BUILD_KEY_PUB_NAME = 'key-build.pub'
 
-    # variables for miner NAND configuration
-    MINER_MAC = 'ethaddr'
-    MINER_HWID = 'miner_hwid'
-    MINER_POOL_HOST = 'miner_pool_host'
-    MINER_POOL_PORT = 'miner_pool_port'
-    MINER_POOL_USER = 'miner_pool_user'
-    MINER_POOL_PASS = 'miner_pool_pass'
-
-    MINER_CFG_INPUT = [
-        (MINER_MAC, 'miner.mac', None),
-        (MINER_HWID, 'miner.hwid', hwid.generate),
-        (MINER_POOL_HOST, 'miner.pool.host', None),
-        (MINER_POOL_PORT, 'miner.pool.port', None),
-        (MINER_POOL_USER, 'miner.pool.user', None),
-        (MINER_POOL_PASS, 'miner.pool.pass', '')
-    ]
-
-    MINER_FIRMWARE = 'firmware'
-    MINER_ENV_SIZE = 0x20000
-    MINER_CFG_SIZE = 0x20000
-
     UENV_TXT = 'uEnv.txt'
 
     MTD_BITSTREAM = 'fpga'
@@ -178,10 +157,17 @@ class Builder:
     UPGRADE_AM_RUNME = 'runme.sh'
     UPGRADE_AM_UBI_INFO = 'ubi_info'
 
+    # sysupgrade attributes
+    SYSUPGRADE_ATTR_MAJOR = 'major'
+    SYSUPGRADE_ATTR_REQUIRE = 'require'
+    SYSUPGRADE_ATTR_INCLUDE = 'include'
+
     # feeds index constants
     FEEDS_INDEX = 'Packages'
     FEEDS_ATTR_PACKAGE = 'Package'
     FEEDS_ATTR_FILENAME = 'Filename'
+    FEEDS_ATTR_VERSION = 'Version'
+    FEEDS_ATTR_REQUIRE = 'Require'
     FEEDS_EXCLUDED_ATTRIBUTES = ['Source', 'Maintainer']
 
     FEED_FIRMWARE = 'firmware'
@@ -211,6 +197,23 @@ class Builder:
         """
         platform = platform or self._config.miner.platform
         return tuple(platform.split('-', 1))
+
+    def _get_sysupgrade_attr(self, name):
+        """
+        Get sysupgrade attribute for current platform specified by matching pattern in
+        the configuration.
+
+        :param name:
+            Name of attribute.
+        :return:
+            Configuration for sysupgrade attribute for current platform.
+        """
+        sysupgrade = self._config.build.sysupgrade
+
+        # find attributes for current platform with prefix pattern
+        for pattern, value in sorted(sysupgrade.items(), reverse=True):
+            if self._config.miner.platform.startswith(pattern) and value.get(name):
+                return value.get(name)
 
     def _write_target_config(self, stream, config):
         """
@@ -250,7 +253,6 @@ class Builder:
         :param config:
             Configuration name prefix.
         """
-        sysupgrade = self._config.build.sysupgrade
         components = [
             ('command', 'COMMAND'),
             ('spl', 'SPL'),
@@ -258,18 +260,58 @@ class Builder:
             ('fpga', 'FPGA')
         ]
 
-        # find includes for current platform with prefix pattern
-        includes = next((value for pattern, value in sorted(sysupgrade.items(), reverse=True)
-                         if self._config.miner.platform.startswith(pattern)), None)
+        # get includes from platform sysupgrade attribute
+        includes = self._get_sysupgrade_attr(self.SYSUPGRADE_ATTR_INCLUDE)
 
         for src_name, dst_name in components:
             if src_name in includes:
                 stream.write('{}{}=y\n'.format(config, dst_name))
 
+    def _write_firmware_major(self, stream, config):
+        """
+        Write major firmware version.
+
+        :param stream:
+            Opened stream for writing configuration.
+        :param config:
+            Configuration name prefix.
+        :return:
+            Current firmware version.
+        """
+        fw_major = self._get_sysupgrade_attr(self.SYSUPGRADE_ATTR_MAJOR) == 'yes'
+        fw_major = self.get_firmware_version() if fw_major else self._get_sysupgrade_attr(self.SYSUPGRADE_ATTR_REQUIRE)
+        logging.debug("Set firmware major version to '{}'".format(fw_major))
+        stream.write('{}="{}"\n'.format(config, fw_major))
+
     def _write_firmware_version(self, stream, config):
+        """
+        Write current firmware version.
+
+        :param stream:
+            Opened stream for writing configuration.
+        :param config:
+            Configuration name prefix.
+        :return:
+            Current firmware version.
+        """
         fw_version = self.get_firmware_version()
         logging.debug("Set firmware version to '{}'".format(fw_version))
         stream.write('{}="{}"\n'.format(config, fw_version))
+
+    def _write_firmware_require(self, stream, config):
+        """
+        Write previous firmware version required by this firmware
+
+        :param stream:
+            Opened stream for writing configuration.
+        :param config:
+            Configuration name prefix.
+        :return:
+            Previous firmware version required by this firmware.
+        """
+        fw_require = self._get_sysupgrade_attr(self.SYSUPGRADE_ATTR_REQUIRE)
+        logging.debug("Set required firmware version to '{}'".format(fw_require))
+        stream.write('{}="{}"\n'.format(config, fw_require))
 
     def _write_external_path(self, stream, config, repo_name: str, name: str):
         """
@@ -293,7 +335,9 @@ class Builder:
     GENERATED_CONFIGS = [
         ('CONFIG_TARGET_', _write_target_config),
         ('CONFIG_SYSUPGRADE_WITH_', _write_sysupgrade),
+        ('CONFIG_FIRMWARE_MAJOR', _write_firmware_major),
         ('CONFIG_FIRMWARE_VERSION', _write_firmware_version),
+        ('CONFIG_FIRMWARE_REQUIRE', _write_firmware_require),
         ('CONFIG_EXTERNAL_KERNEL_TREE', partial(_write_external_path, repo_name=LINUX, name='kernel')),
         ('CONFIG_EXTERNAL_CGMINER_TREE', partial(_write_external_path, repo_name=CGMINER, name='CGMiner')),
         ('CONFIG_EXTERNAL_UBOOT_TREE', partial(_write_external_path, repo_name=UBOOT, name='U-Boot')),
@@ -535,7 +579,7 @@ class Builder:
         :return:
             Miner hostname for current configuration.
         """
-        mac = self._config.miner.mac
+        mac = self._config.net.mac
         return 'miner-' + ''.join(mac.split(':')[-3:]).lower()
 
     def _get_utility(self, name: str):
@@ -1037,7 +1081,7 @@ class Builder:
             Write also recovery parameters.
         """
         if self._config.uenv.get('mac', 'no') == 'yes':
-            stream.write("{}={}\n".format(self.MINER_MAC, self._config.miner.mac))
+            stream.write("{}={}\n".format(nand.NET_MAC, self._config.net.mac))
 
         bool_attributes = (
             'factory_reset',
@@ -1113,29 +1157,6 @@ class Builder:
             String with path to MTD device.
         """
         return '/dev/mtd' + {1: '7', 2: '8'}.get(index)
-
-    def _write_miner_cfg_input(self, stream, excluded=set()):
-        """
-        Write to the stream miner configuration input for NAND
-
-        :stream:
-            Opened stream for writing miner configuration input.
-        :excluded:
-            Dictionary with excluded attributes.
-        """
-        for name, path, default in self.MINER_CFG_INPUT:
-            if name in excluded:
-                continue
-            value = self._config.get(path)
-            if value is None:
-                if default is None:
-                    logging.error("Missing miner configuration for '{}' in '{}'".format(name, path))
-                    raise BuilderStop
-                # use default value when configuration is not set in YAML
-                value = default if type(default) is str else default()
-            if value:
-                # attributes with empty value are completely omitted
-                stream.write('{}={}\n'.format(name, value).encode())
 
     def _write_nand_uboot(self, ssh, image):
         """
@@ -1353,10 +1374,11 @@ class Builder:
         # write miner configuration to miner_cfg NAND
         if self._config.deploy.write_miner_cfg == 'yes':
             miner_cfg_input = io.BytesIO()
-            self._write_miner_cfg_input(miner_cfg_input)
+            if not nand.write_miner_cfg_input(self._config, miner_cfg_input):
+                raise BuilderStop
             # generate image file with NAND configuration
             mkenvimage = self._get_utility(self.LEDE_MKENVIMAGE)
-            output = self._run(mkenvimage, '-r', '-p', str(0), '-s', str(self.MINER_CFG_SIZE), '-',
+            output = self._run(mkenvimage, '-r', '-p', str(0), '-s', str(nand.MINER_CFG_SIZE), '-',
                                input=miner_cfg_input.getvalue(), output=True)
             logging.info("Writing miner configuration to NAND partition 'miner_cfg'...")
             with ssh.pipe('mtd', 'write', '-', 'miner_cfg') as remote:
@@ -1365,9 +1387,9 @@ class Builder:
         # change miner configuration in U-Boot env
         if self._config.deploy.set_miner_env == 'yes' and self._config.deploy.reset_uboot_env == 'no':
             logging.info("Writing miner configuration to U-Boot env in NAND...")
-            ssh.run('fw_setenv', self.MINER_MAC, self._config.miner.mac)
-            ssh.run('fw_setenv', self.MINER_HWID, self._config.miner.hwid)
-            ssh.run('fw_setenv', self.MINER_FIRMWARE, str(self._config.miner.firmware))
+            ssh.run('fw_setenv', nand.NET_MAC, self._config.net.mac)
+            ssh.run('fw_setenv', nand.MINER_HWID, self._config.miner.hwid)
+            ssh.run('fw_setenv', nand.MINER_FIRMWARE, str(self._config.miner.firmware))
 
         reset_uboot_env = self._config.deploy.reset_uboot_env == 'yes'
         reset_overlay = self._config.deploy.reset_overlay == 'yes'
@@ -1409,7 +1431,7 @@ class Builder:
         :param nand_config:
             Modify configuration files/partitions on NAND.
         """
-        hostname = self._config.deploy.ssh.get('hostname', None)
+        hostname = self._config.deploy.ssh.get('hostname', None) or self._config.net.get('hostname', None)
         password = self._config.deploy.ssh.get('password', None)
         username = self._config.deploy.ssh.username
 
@@ -1500,7 +1522,8 @@ class Builder:
             Bytes stream with miner configuration.
         """
         miner_cfg_input = io.BytesIO()
-        self._write_miner_cfg_input(miner_cfg_input, {self.MINER_MAC, self.MINER_HWID})
+        if not nand.write_miner_cfg_input(self._config, miner_cfg_input, {nand.NET_MAC, nand.MINER_HWID}):
+            raise BuilderStop
         return miner_cfg_input
 
     def _create_upgrade_uboot_env(self):
@@ -1519,7 +1542,7 @@ class Builder:
             shutil.copyfileobj(base_input_file, uboot_env_input)
 
         return io.BytesIO(
-            self._run(mkenvimage, '-r', '-p', str(0), '-s', str(self.MINER_ENV_SIZE), '-',
+            self._run(mkenvimage, '-r', '-p', str(0), '-s', str(nand.MINER_ENV_SIZE), '-',
                       input=uboot_env_input.getvalue(), output=True)
         )
 
@@ -1534,7 +1557,7 @@ class Builder:
         miner_cfg_input = self._create_upgrade_miner_cfg_input()
 
         return io.BytesIO(
-            self._run(mkenvimage, '-r', '-p', str(0), '-s', str(self.MINER_CFG_SIZE), '-',
+            self._run(mkenvimage, '-r', '-p', str(0), '-s', str(nand.MINER_CFG_SIZE), '-',
                       input=miner_cfg_input.getvalue(), output=True)
         )
 
@@ -1892,6 +1915,7 @@ class Builder:
         # prepare base feeds index
         feeds_base = None
         feeds_base_url = self._config.deploy.get('feeds_base', None)
+        fw_require = self._get_sysupgrade_attr(self.SYSUPGRADE_ATTR_REQUIRE)
 
         if feeds_base_url:
             # appending to previous index
@@ -1906,6 +1930,9 @@ class Builder:
             for attribute, value in firmware_package.items():
                 if attribute not in self.FEEDS_EXCLUDED_ATTRIBUTES:
                     dst_packages.write('{}: {}\n'.format(attribute, value))
+                if fw_require and attribute == self.FEEDS_ATTR_VERSION:
+                    # insert previous firmware requirements after version attribute
+                    dst_packages.write('{}: {}\n'.format(self.FEEDS_ATTR_REQUIRE, fw_require))
 
         # sign the created index file
         usign = self._get_utility(self.LEDE_USIGN)

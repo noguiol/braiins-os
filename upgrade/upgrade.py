@@ -19,7 +19,10 @@
 
 import argparse
 import subprocess
+import tempfile
+import tarfile
 import sys
+import os
 
 import upgrade.hwid as hwid
 import upgrade.platform as platform
@@ -27,15 +30,18 @@ import upgrade.backup as backup
 
 from upgrade.platform import PlatformStop
 from upgrade.ssh import SSHManager, SSHError
-from upgrade.transfer import upload_local_files, wait_for_port
+from upgrade.transfer import upload_local_files, wait_for_port, Progress
 
 USERNAME = 'root'
 PASSWORD = None
 
 SYSTEM_DIR = 'system'
-BACKUP_DIR = 'backup'
 SOURCE_DIR = 'firmware'
 TARGET_DIR = '/tmp/firmware'
+
+STAGE3_DIR = 'upgrade'
+STAGE3_FILE = 'stage3.tgz'
+STAGE3_SCRIPT = 'stage3.sh'
 
 REBOOT_DELAY = (3, 5)
 
@@ -58,7 +64,21 @@ def check_compatibility(ssh):
         pass
 
 
+def cleanup_system(ssh):
+    print("Cleaning remote system...")
+    platform.cleanup_system(ssh)
+
+
 def main(args):
+    stage3_path = args.post_upgrade
+    if stage3_path:
+        if not os.path.isdir(stage3_path):
+            print("Post-upgrade path '{}' is missing or is not a directory!".format(stage3_path))
+            raise UpgradeStop
+        if not os.path.isfile(os.path.join(stage3_path, STAGE3_SCRIPT)):
+            print("Script '{}' is missing in '{}'!".format(STAGE3_SCRIPT, stage3_path))
+            raise UpgradeStop
+
     print("Connecting to remote host...")
     with SSHManager(args.hostname, USERNAME, PASSWORD) as ssh:
         # check compatibility of remote server
@@ -66,7 +86,7 @@ def main(args):
 
         if not args.no_backup:
             mac = backup.ssh_mac(ssh)
-            backup_dir = backup.get_output_dir(BACKUP_DIR, mac)
+            backup_dir = backup.get_output_dir(mac)
             if not platform.backup_firmware(args, ssh, backup_dir, mac):
                 raise UpgradeStop
 
@@ -75,14 +95,23 @@ def main(args):
         ssh.run('mkdir', '-p', TARGET_DIR)
 
         # upgrade remote system with missing utilities
-        if not platform.prepare_system(ssh, SYSTEM_DIR):
-            raise UpgradeStop
+        print("Preparing remote system...")
+        platform.prepare_system(ssh, SYSTEM_DIR)
 
         # copy firmware files to the server over SFTP
         sftp = ssh.open_sftp()
         sftp.chdir(TARGET_DIR)
         print("Uploading firmware...")
         upload_local_files(sftp, SOURCE_DIR)
+        if stage3_path:
+            print("Uploading post-upgrade (stage3)...")
+            with tempfile.TemporaryDirectory() as stage3_dir:
+                stage3_file = os.path.join(stage3_dir, STAGE3_FILE)
+                with tarfile.open(stage3_file, "w:gz") as stage3:
+                    stage3.add(stage3_path, STAGE3_DIR)
+                    stage3.close()
+                    with Progress(STAGE3_FILE, os.path.getsize(stage3_file)) as progress:
+                        sftp.put(stage3_file, STAGE3_FILE, callback=progress)
         sftp.close()
 
         # generate HW identifier for miner
@@ -91,17 +120,26 @@ def main(args):
         # get other stage1 parameters
         keep_network = 'no' if args.no_keep_network else 'yes'
         keep_hostname = 'yes' if args.keep_hostname else 'no'
+        dry_run = 'yes' if args.dry_run else 'no'
 
         # run stage1 upgrade process
         try:
             print("Upgrading firmware...")
             stdout, _ = ssh.run('cd', TARGET_DIR, '&&', 'ls', '-l', '&&',
-                                "/bin/sh stage1.sh '{}' {} {}".format(hw_id, keep_network, keep_hostname))
+                                "/bin/sh stage1.sh '{}' {} {} {}".format(hw_id, keep_network, keep_hostname, dry_run))
         except subprocess.CalledProcessError as error:
+            cleanup_system(ssh)
+            print()
+            print("Error log:")
             for line in error.stderr.readlines():
                 print(line, end='')
             raise UpgradeStop
         else:
+            if args.dry_run:
+                cleanup_system(ssh)
+                print('Dry run of upgrade was successful!')
+                raise UpgradeStop
+
             for line in stdout.readlines():
                 print(line, end='')
             print('Upgrade was successful!')
@@ -135,6 +173,10 @@ if __name__ == "__main__":
                         help='keep miner hostname')
     parser.add_argument('--no-wait', action='store_true',
                         help='do not wait until system is fully upgraded')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='do all upgrade steps without actual upgrade')
+    parser.add_argument('--post-upgrade', nargs='?',
+                        help='path to directory with stage3.sh script')
 
     # parse command line arguments
     args = parser.parse_args(sys.argv[1:])

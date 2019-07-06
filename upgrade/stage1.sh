@@ -17,8 +17,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-if [ "$#" -ne 3 ]; then
-    echo "Illegal number of parameters"
+if [ "$#" -ne 4 ]; then
+    echo "Illegal number of parameters" >&2
     exit 1
 fi
 
@@ -27,6 +27,7 @@ set -e
 MINER_HWID="$1"
 KEEP_NET_CONFIG="$2"
 KEEP_HOSTNAME="$3"
+DRY_RUN="$4"
 
 UBOOT_ENV_CFG="uboot_env.config"
 
@@ -36,6 +37,7 @@ UBOOT_ENV_DATA="uboot_env.bin"
 BITSTREAM_DATA="system.bit.gz"
 KERNEL_IMAGE="fit.itb"
 STAGE2_FIRMWARE="stage2.tgz"
+STAGE3_FIRMWARE="stage3.tgz"
 
 sed_variables() {
     local value
@@ -55,6 +57,8 @@ sed_variables() {
 
 # prepare configuration file
 sed_variables "$UBOOT_ENV_CFG" UBOOT_ENV_MTD UBOOT_ENV1_OFF UBOOT_ENV2_OFF
+
+[ x"$DRY_RUN" == x"yes" ] && exit 0
 
 flash_eraseall /dev/mtd${UBOOT_MTD} 2>&1
 
@@ -77,41 +81,58 @@ nandwrite -ps ${SRC_KERNEL_OFF} /dev/mtd${SRC_STAGE2_MTD} "$KERNEL_IMAGE" 2>&1
 echo "Writing stage2 tarball..."
 nandwrite -ps ${SRC_STAGE2_OFF} /dev/mtd${SRC_STAGE2_MTD} "$STAGE2_FIRMWARE" 2>&1
 
+if [ -f "$STAGE3_FIRMWARE" ]; then
+	echo "Writing stage3 tarball..."
+	nandwrite -ps ${SRC_STAGE3_OFF} /dev/mtd${SRC_STAGE3_MTD} "$STAGE3_FIRMWARE" 2>&1
+	dst_stage3_off=${DST_STAGE3_OFF}
+	dst_stage3_size=$(file_size "$STAGE3_FIRMWARE")
+	dst_stage3_mtd=${DST_STAGE3_MTD}
+fi
+
 echo "U-Boot configuration..."
 
-# bitstream metadata
-fw_setenv -c "$UBOOT_ENV_CFG" bitstream_off ${BITSTREAM_OFF}
-fw_setenv -c "$UBOOT_ENV_CFG" bitstream_size $(file_size "$BITSTREAM_DATA")
-
-# set kernel metadata
-fw_setenv -c "$UBOOT_ENV_CFG" kernel_off ${DST_KERNEL_OFF}
-fw_setenv -c "$UBOOT_ENV_CFG" kernel_size $(file_size "$KERNEL_IMAGE")
-
-# set firmware stage2 metadata
-fw_setenv -c "$UBOOT_ENV_CFG" stage2_off ${DST_STAGE2_OFF}
-fw_setenv -c "$UBOOT_ENV_CFG" stage2_size $(file_size "$STAGE2_FIRMWARE")
-fw_setenv -c "$UBOOT_ENV_CFG" stage2_mtd ${DST_STAGE2_MTD}
-
-fw_setenv -c "$UBOOT_ENV_CFG" ethaddr ${ETHADDR}
+fw_setenv -c "$UBOOT_ENV_CFG" --script - <<-EOF
+	# bitstream metadata
+	bitstream_off ${BITSTREAM_OFF}
+	bitstream_size $(file_size "$BITSTREAM_DATA")
+	#
+	# set kernel metadata
+	kernel_off ${DST_KERNEL_OFF}
+	kernel_size $(file_size "$KERNEL_IMAGE")
+	#
+	# set firmware stage2 metadata
+	stage2_off ${DST_STAGE2_OFF}
+	stage2_size $(file_size "$STAGE2_FIRMWARE")
+	stage2_mtd ${DST_STAGE2_MTD}
+	#
+	# set firmware stage3 metadata
+	stage3_off ${dst_stage3_off}
+	stage3_size ${dst_stage3_size}
+	stage3_mtd ${dst_stage3_mtd}
+	#
+	ethaddr ${ETHADDR}
+	#
+	# set miner configuration
+	miner_hwid ${MINER_HWID}
+	#
+	# s9 specific configuration
+	miner_freq ${MINER_FREQ}
+	miner_voltage ${MINER_VOLTAGE}
+	miner_fixed_freq ${MINER_FIXED_FREQ}
+EOF
 
 # set network konfiguration
 if [ x"$KEEP_NET_CONFIG" == x"yes" ]; then
-    fw_setenv -c "$UBOOT_ENV_CFG" net_ip ${NET_IP}
-    fw_setenv -c "$UBOOT_ENV_CFG" net_mask ${NET_MASK}
-    fw_setenv -c "$UBOOT_ENV_CFG" net_gateway ${NET_GATEWAY}
-    fw_setenv -c "$UBOOT_ENV_CFG" net_dns_servers ${NET_DNS_SERVERS}
+	fw_setenv -c "$UBOOT_ENV_CFG" --script - <<-EOF
+		net_ip ${NET_IP}
+		net_mask ${NET_MASK}
+		net_gateway ${NET_GATEWAY}
+		net_dns_servers ${NET_DNS_SERVERS}
+	EOF
 fi
 if [ x"$KEEP_HOSTNAME" == x"yes" ]; then
     fw_setenv -c "$UBOOT_ENV_CFG" net_hostname ${NET_HOSTNAME}
 fi
-
-# set miner configuration
-fw_setenv -c "$UBOOT_ENV_CFG" miner_hwid ${MINER_HWID}
-
-# s9 specific configuration
-fw_setenv -c "$UBOOT_ENV_CFG" miner_freq ${MINER_FREQ}
-fw_setenv -c "$UBOOT_ENV_CFG" miner_voltage ${MINER_VOLTAGE}
-fw_setenv -c "$UBOOT_ENV_CFG" miner_fixed_freq ${MINER_FIXED_FREQ}
 
 echo
 echo "Content of U-Boot configuration:"

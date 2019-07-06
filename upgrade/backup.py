@@ -14,9 +14,12 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import subprocess
 import datetime
 import shutil
 import os
+
+DEFAULT_DIR = 'backup'
 
 MODE_SD = 'sd'
 MODE_NAND = 'nand'
@@ -63,20 +66,51 @@ def parse_uenv(backup_dir):
     return None
 
 
-def get_output_dir(path, mac):
-    output_dir = os.path.join(path, '{}-{:%Y-%m-%d}'.format(mac.replace(':', ''), datetime.datetime.now()))
-    os.makedirs(output_dir, exist_ok=True)
+def get_stream_size(stream):
+    stream_pos = stream.tell()
+    stream_size = stream.seek(0, os.SEEK_END)
+    stream.seek(stream_pos)
+    return stream_size
+
+
+def get_output_dir(mac, path=None, date=True, create=True):
+    path = path or DEFAULT_DIR
+    output_dir = os.path.join(path, mac.replace(':', '').lower())
+    if date:
+        output_dir += '-{:%Y-%m-%d}'.format(datetime.datetime.now())
+    create and os.makedirs(output_dir, exist_ok=True)
     return output_dir
 
 
+def get_default_hostname(mac):
+    return 'miner-' + ''.join(mac.split(':')[-3:]).lower()
+
+
+def ssh_run(ssh, *args):
+    return next(ssh.run(*args)[0]).strip()
+
+
 def ssh_mode(ssh):
-    stdout, _ = ssh.run('cat', '/etc/bos_mode')
-    return next(stdout).strip()
+    try:
+        return ssh_run(ssh, 'cat', '/etc/bos_mode')
+    except subprocess.CalledProcessError:
+        # fallback for old releases
+        stdout, _ = ssh.run('mount')
+        for line in stdout:
+            if line.startswith('/dev/ubi0_2 on /overlay'):
+                return MODE_NAND
+            elif line.startswith('/dev/mmcblk0p2 on /overlay'):
+                return MODE_SD
+        else:
+            return MODE_RECOVERY
 
 
 def ssh_mac(ssh):
-    stdout, _ = ssh.run('cat', '/sys/class/net/eth0/address')
-    return next(stdout).strip()
+    return ssh_run(ssh, 'cat', '/sys/class/net/eth0/address')
+
+
+def ssh_factory_mtdparts(args, ssh, backup_dir):
+    return parse_uenv(backup_dir)
 
 
 def ssh_backup(args, ssh, path, mac):
@@ -85,7 +119,7 @@ def ssh_backup(args, ssh, path, mac):
     with ssh.pipe('cat', '/proc/mtd') as remote:
         next(remote.stdout)
         for line in remote.stdout:
-            dev, size, _, name = line.split()
+            dev, size, _, name = line.strip().split(None, 3)
             dev = dev[:-1]
             size = int(size, 16)
             name = name[1:-1]

@@ -45,9 +45,6 @@ class CommandManager:
         self._config = miner.load_config(args.config)
 
         # set optional keys to default value
-        self._config.setdefault('miner.pool.host', 'stratum+tcp://stratum.slushpool.com')
-        self._config.setdefault('miner.pool.port', 3333)
-        self._config.setdefault('miner.pool.user', 'braiinstest.worker1')
         self._config.setdefault('build.jobs', 1)
         self._config.setdefault('build.verbose', 'no')
         self._config.setdefault('remote.fetch', 'no')
@@ -134,7 +131,7 @@ class CommandManager:
         logging.debug("Called command 'deploy'")
         # change target MAC address
         if self._args.mac:
-            self._config.miner.mac = self._args.mac
+            self._config.net.mac = self._args.mac
         # change target hostname and override MAC determination
         if self._args.hostname:
             self._config.deploy.ssh.hostname = self._args.hostname
